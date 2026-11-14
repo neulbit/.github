@@ -1,0 +1,113 @@
+name: Issue Type 자동 처리
+
+on:
+  workflow_call:
+
+permissions:
+  issues: write
+
+jobs:
+  set-unclassified:
+    name: Type 자동 처리
+    runs-on: ubuntu-latest
+    steps:
+      - name: Type이 비어 있으면 Unclassified 지정
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const marker = '<!-- neulbit-issue-type-auto-failure:v1 -->';
+            const {owner, repo} = context.repo;
+            const issueNumber = context.payload.issue?.number;
+            const apiHeaders = {'X-GitHub-Api-Version': '2026-03-10'};
+
+            const summary = async (handled, review, failed, message) => {
+              await core.summary
+                .addHeading('Issue Type 자동 처리')
+                .addTable([
+                  [{data: '구분', header: true}, {data: '건수', header: true}],
+                  ['자동 처리', String(handled)],
+                  ['검토 필요', String(review)],
+                  ['실패', String(failed)],
+                ])
+                .addRaw(message)
+                .write();
+            };
+
+            const getIssue = () => github.request(
+              'GET /repos/{owner}/{repo}/issues/{issue_number}',
+              {owner, repo, issue_number: issueNumber, headers: apiHeaders},
+            );
+
+            const stableFields = (issue) => JSON.stringify({
+              title: issue.title,
+              body: issue.body,
+              state: issue.state,
+              state_reason: issue.state_reason,
+              milestone: issue.milestone?.id ?? null,
+              assignees: (issue.assignees ?? []).map((item) => item.login).sort(),
+              labels: (issue.labels ?? []).map((item) =>
+                typeof item === 'string' ? item : item.name
+              ).sort(),
+              locked: issue.locked,
+              active_lock_reason: issue.active_lock_reason,
+            });
+
+            try {
+              if (!issueNumber || context.payload.issue?.pull_request) {
+                await summary(0, 1, 0, '검토 필요: 처리할 이슈를 확인할 수 없습니다.');
+                return;
+              }
+
+              const before = (await getIssue()).data;
+              if (before.type !== null) {
+                await summary(0, 0, 0, '자동 처리: 기존 Type을 그대로 보존했습니다.');
+                return;
+              }
+
+              const beforeFields = stableFields(before);
+              await github.request(
+                'PATCH /repos/{owner}/{repo}/issues/{issue_number}',
+                {
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  type: 'Unclassified',
+                  headers: apiHeaders,
+                },
+              );
+
+              const after = (await getIssue()).data;
+              const afterType = typeof after.type === 'string' ? after.type : after.type?.name;
+              if (afterType !== 'Unclassified') {
+                throw new Error('Type 변경 결과를 확인하지 못했습니다.');
+              }
+              if (stableFields(after) !== beforeFields) {
+                throw new Error('Type 외의 이슈 정보가 달라졌습니다.');
+              }
+
+              await summary(1, 0, 0, '자동 처리: Type을 Unclassified로 지정하고 결과를 확인했습니다.');
+            } catch (error) {
+              let commentResult = '실패 안내 댓글을 남기지 못했습니다.';
+              if (issueNumber) {
+                try {
+                  const comments = await github.paginate(
+                    github.rest.issues.listComments,
+                    {owner, repo, issue_number: issueNumber, per_page: 100},
+                  );
+                  if (!comments.some((comment) => comment.body?.includes(marker))) {
+                    await github.rest.issues.createComment({
+                      owner,
+                      repo,
+                      issue_number: issueNumber,
+                      body: `${marker}\nType 자동 처리에 실패했습니다. 기존 내용은 그대로 두었습니다. 검토가 필요합니다.`,
+                    });
+                  }
+                  commentResult = '실패 안내 댓글을 확인했습니다.';
+                } catch (commentError) {
+                  core.warning(`실패 안내 댓글 오류: ${commentError.message}`);
+                }
+              }
+              await summary(0, 1, 1, `실패: ${error.message} ${commentResult}`);
+              core.setFailed(`Type 자동 처리 실패: ${error.message}`);
+            }
