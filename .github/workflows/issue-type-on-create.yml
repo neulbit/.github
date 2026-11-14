@@ -1,0 +1,14 @@
+name: Issue Type 자동 처리 요청
+
+on:
+  issues:
+    types: [opened, transferred]
+
+permissions:
+  issues: write
+
+jobs:
+  handle-issue-type:
+    uses: ./.github/workflows/issue-type-auto.yml
+    permissions:
+      issues: write
